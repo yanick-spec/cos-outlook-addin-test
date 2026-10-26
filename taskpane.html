@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CoS Drafts</title>
 <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+<script src="vendor/msal-browser.min.js"></script>
 <style>
   :root {
     --shell: #eef0f2; --card: #ffffff; --ink: #111111; --muted: #6b7076;
@@ -72,6 +73,15 @@
       <input id="model" type="text">
     </div>
     <div class="field">
+      <label for="clientId">Calendar: Entra app (client) ID</label>
+      <input id="clientId" type="text" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autocomplete="off">
+    </div>
+    <div class="field">
+      <label><input id="useCalendar" type="checkbox" style="width:auto;margin-right:6px">Use my calendar for time slots</label>
+      <button class="linkbtn" id="testCalendar" type="button">Test calendar</button>
+      <div class="status" id="calStatus"></div>
+    </div>
+    <div class="field">
       <label for="calendly">Calendly link</label>
       <input id="calendly" type="text">
     </div>
@@ -131,15 +141,18 @@
     "- English: start with \"Hi <first name>,\" and end with \"Best,\" and \"Yanick\" on the next line.",
     "- No signature block (Outlook adds it).",
     "- Never invent commitments, numbers or dates. Where Yanick must decide or fill in a fact, leave a bracketed placeholder like [Termin bestätigen] or [Zahl prüfen].",
-    "- Scheduling a 1:1 with externals: offer the Calendly link. If the sender proposed fixed slots, do not pick one yourself; leave [Slot wählen].",
+    "- Scheduling: if you get Yanick's free time windows, use them (see scheduling rules). Without calendar data, offer the Calendly link to externals and leave [Slot wählen] instead of picking a time.",
     "- Match the formality of the sender (du/Sie) in German.",
     "- Answer every direct question in the latest message; ignore older quoted parts unless relevant."
   ].join("\n");
 
   var DEFAULTS = {
     apiKey: "",
-    model: "claude-sonnet-4-5",
+    model: "claude-sonnet-5-5",
     calendly: "https://calendly.com/y-rosenbaum-ecapital/30min",
+    clientId: "",
+    tenant: "ecapital.vc",
+    useCalendar: "1",
     styleRules: DEFAULT_STYLE
   };
 
@@ -193,6 +206,12 @@
       var v = rs.get(k);
       settings[k] = (v === undefined || v === null || v === "") ? DEFAULTS[k] : v;
     });
+    if (/^claude-sonnet-4/.test(settings.model)) settings.model = DEFAULTS.model; // retired model, migrate
+    settings.styleRules = String(settings.styleRules).split("\n").map(function (l) {   // migrate old scheduling rule
+      return /Scheduling a 1:1 with externals/.test(l) ? DEFAULT_STYLE.split("\n").filter(function (d) { return /^- Scheduling:/.test(d); })[0] : l;
+    }).join("\n");
+    $("clientId").value = settings.clientId;
+    $("useCalendar").checked = settings.useCalendar === "1";
     $("apiKey").value = settings.apiKey;
     $("model").value = settings.model;
     $("calendly").value = settings.calendly;
@@ -204,6 +223,9 @@
     settings.apiKey = $("apiKey").value.trim();
     settings.model = $("model").value.trim() || DEFAULTS.model;
     settings.calendly = $("calendly").value.trim();
+    settings.clientId = $("clientId").value.trim();
+    settings.useCalendar = $("useCalendar").checked ? "1" : "0";
+    pca = null;
     settings.styleRules = $("styleRules").value.trim() || DEFAULT_STYLE;
     Object.keys(settings).forEach(function (k) { rs.set(k, settings[k]); });
     rs.saveAsync(function (r) {
@@ -249,8 +271,95 @@
     if (ctx.body.length > MAX_BODY) ctx.body = ctx.body.slice(0, MAX_BODY) + "\n[…thread truncated…]";
   }
 
+  // ---------- calendar (Microsoft Graph via nested app auth) ----------
+  var pca = null;
+  var WORK_START = 9, WORK_END = 18, DAYS_AHEAD = 14, MIN_SLOT_MIN = 30, LEAD_MIN = 120;
+  var WD = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"];
+
+  async function getGraphToken() {
+    if (!window.msal) throw new Error("Sign-in library didn't load.");
+    if (!pca) {
+      pca = await msal.createNestablePublicClientApplication({
+        auth: { clientId: settings.clientId, authority: "https://login.microsoftonline.com/" + (settings.tenant || "organizations") }
+      });
+    }
+    var req = { scopes: ["Calendars.ReadBasic"] };
+    try { return (await pca.acquireTokenSilent(req)).accessToken; }
+    catch (e) { return (await pca.acquireTokenPopup(req)).accessToken; }
+  }
+  // Naive Berlin wall-clock time <-> number (ms, using UTC fields so the browser's own zone never interferes)
+  function naive(str) {
+    var m = String(str).match(/(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+    return Date.UTC(+m[1], m[2] - 1, +m[3], +m[4], +m[5]);
+  }
+  function berlinNow() {
+    var parts = {};
+    new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Berlin", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" })
+      .formatToParts(new Date()).forEach(function (x) { parts[x.type] = x.value; });
+    return Date.UTC(+parts.year, parts.month - 1, +parts.day, +parts.hour, +parts.minute);
+  }
+  function hhmm(t) { var d = new Date(t); return String(d.getUTCHours()).padStart(2, "0") + ":" + String(d.getUTCMinutes()).padStart(2, "0"); }
+  function dayLabel(t) { var d = new Date(t); return WD[d.getUTCDay()] + ", " + String(d.getUTCDate()).padStart(2, "0") + "." + String(d.getUTCMonth() + 1).padStart(2, "0") + "."; }
+
+  async function fetchEvents(token) {
+    var start = new Date(), end = new Date(Date.now() + DAYS_AHEAD * 864e5);
+    var url = "https://graph.microsoft.com/v1.0/me/calendarView?startDateTime=" + start.toISOString() +
+      "&endDateTime=" + end.toISOString() + "&$select=subject,start,end,showAs,isAllDay,isCancelled&$top=250";
+    var events = [];
+    while (url) {
+      var r = await fetch(url, { headers: { Authorization: "Bearer " + token, Prefer: 'outlook.timezone="Europe/Berlin"' } });
+      if (!r.ok) throw new Error("Calendar request failed (" + r.status + ")");
+      var j = await r.json();
+      events = events.concat(j.value || []);
+      url = j["@odata.nextLink"] || null;
+    }
+    return events;
+  }
+  function freeWindows(events) {
+    var busy = events.filter(function (e) {
+      return !e.isCancelled && e.showAs !== "free" && e.showAs !== "workingElsewhere";
+    }).map(function (e) { return [naive(e.start.dateTime), naive(e.end.dateTime)]; });
+    var now = berlinNow();
+    var earliest = Math.ceil((now + LEAD_MIN * 6e4) / 18e5) * 18e5; // now + lead, rounded up to :00/:30
+    var day0 = Math.floor(now / 864e5) * 864e5, out = [];
+    for (var i = 0; i < DAYS_AHEAD; i++) {
+      var day = day0 + i * 864e5, wd = new Date(day).getUTCDay();
+      if (wd === 0 || wd === 6) continue;
+      var ws = Math.max(day + WORK_START * 36e5, earliest), we = day + WORK_END * 36e5;
+      if (ws >= we) continue;
+      var free = [[ws, we]];
+      busy.forEach(function (b) {
+        free = free.flatMap(function (f) {
+          if (b[1] <= f[0] || b[0] >= f[1]) return [f];
+          var parts = [];
+          if (b[0] > f[0]) parts.push([f[0], b[0]]);
+          if (b[1] < f[1]) parts.push([b[1], f[1]]);
+          return parts;
+        });
+      });
+      free = free.filter(function (f) { return f[1] - f[0] >= MIN_SLOT_MIN * 6e4; });
+      out.push(dayLabel(day) + ": " + (free.length ? free.map(function (f) { return hhmm(f[0]) + "–" + hhmm(f[1]); }).join(", ") : "keine freien Slots"));
+    }
+    return out;
+  }
+  async function getFreeSlots() {
+    var token = await getGraphToken();
+    return freeWindows(await fetchEvents(token));
+  }
+  async function testCalendar() {
+    settings.clientId = $("clientId").value.trim(); pca = null;
+    if (!settings.clientId) { setStatus($("calStatus"), "Enter the client ID first.", "err"); return; }
+    setStatus($("calStatus"), "<span class=\"spinner\"></span>Reading calendar…");
+    try {
+      var w = await getFreeSlots();
+      setStatus($("calStatus"), "Connected. Next free windows:<br>" + w.slice(0, 3).map(esc).join("<br>"), "ok");
+    } catch (e) {
+      setStatus($("calStatus"), "Calendar error: " + esc(e.message || e), "err");
+    }
+  }
+
   // ---------- prompt ----------
-  function buildPrompt(instruction) {
+  function buildPrompt(instruction, slots) {
     var system =
       "You are the chief of staff of Yanick Rosenbaum, Investment Manager DeepTech / Cybersecurity at " +
       "eCAPITAL Entrepreneurial Partners (venture capital, Germany; colleagues use @ecapital.vc addresses). " +
@@ -281,6 +390,14 @@
       parts.push("<current_draft>\n" + ctx.body + "\n</current_draft>");
       parts.push("Write the new text to go at the top of this mail (it replaces anything Yanick started; build on his notes if there are any).");
     }
+    if (slots && slots.length) {
+      parts.push("");
+      parts.push("Yanick's free time windows from his Outlook calendar (Europe/Berlin, working hours " + WORK_START + ":00–" + WORK_END + ":00, meetings, blockers and travel already removed):");
+      parts.push(slots.join("\n"));
+      parts.push("Scheduling rules: If the sender proposed specific times, accept one that lies completely inside a free window (the earliest fitting one unless told otherwise) and say clearly which. " +
+        "If none fit, say so briefly and offer 2–3 concrete alternatives from the free windows. If the sender asks when Yanick is free, offer 2–3 concrete 30-minute options on different days, plus the Calendly link for externals. " +
+        "Never propose a time outside these windows. Add the time zone (CET/CEST) when the recipient is likely outside Germany. If the mail isn't about scheduling, ignore this calendar data.");
+    }
     parts.push("");
     parts.push(instruction
       ? "What Yanick wants the reply to say: " + instruction
@@ -298,7 +415,14 @@
     var btn = $("generate");
     btn.disabled = true;
     setStatus($("genStatus"), "<span class=\"spinner\"></span>Drafting…");
-    var p = buildPrompt($("instruction").value.trim());
+    var slots = null, calNote = "";
+    if (settings.useCalendar === "1" && settings.clientId) {
+      setStatus($("genStatus"), "<span class=\"spinner\"></span>Checking calendar…");
+      try { slots = await getFreeSlots(); }
+      catch (e) { calNote = " (Calendar not available: " + esc(e.message || e) + ")"; }
+      setStatus($("genStatus"), "<span class=\"spinner\"></span>Drafting…");
+    }
+    var p = buildPrompt($("instruction").value.trim(), slots);
     try {
       var res = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
@@ -325,7 +449,7 @@
       if (!text) throw new Error("Empty answer from Claude.");
       $("draft").value = text;
       $("resultCard").classList.remove("hidden");
-      setStatus($("genStatus"), "");
+      setStatus($("genStatus"), calNote || (slots ? "Used your calendar for times." : ""), calNote ? "err" : "ok");
       setStatus($("resultStatus"), "");
       $("resultCard").scrollIntoView({ behavior: "smooth" });
     } catch (e) {
@@ -389,6 +513,7 @@
     loadSettings();
     $("toggleSettings").addEventListener("click", function () { $("settingsCard").classList.toggle("hidden"); });
     $("saveSettings").addEventListener("click", saveSettings);
+    $("testCalendar").addEventListener("click", testCalendar);
     $("resetStyle").addEventListener("click", function () { $("styleRules").value = DEFAULT_STYLE; });
     $("generate").addEventListener("click", generate);
     $("openReply").addEventListener("click", function () { openReply(false); });
