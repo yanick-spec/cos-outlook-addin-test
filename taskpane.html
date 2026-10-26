@@ -6,6 +6,7 @@
 <title>CoS Drafts</title>
 <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
 <script src="vendor/msal-browser.min.js"></script>
+<script src="vendor/jszip.min.js"></script>
 <style>
   :root {
     --shell: #eef0f2; --card: #ffffff; --ink: #111111; --muted: #6b7076;
@@ -23,6 +24,7 @@
   .label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 6px; }
   .meta b { font-weight: 600; }
   .meta div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .meta .note, .meta .files, .meta .files div { white-space: normal; overflow: visible; }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
   .chip {
     border: 1px solid var(--line); background: var(--chip); color: var(--ink);
@@ -51,6 +53,11 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   .hidden { display: none !important; }
   .field { margin-bottom: 10px; }
+  .files { margin-top: 8px; font-size: 12px; }
+  .files div { display: flex; justify-content: space-between; gap: 8px; padding: 3px 0; border-top: 1px solid var(--line); }
+  .files div:first-child { border-top: 0; }
+  .links a { color: var(--ink); word-break: break-all; }
+  .note { font-size: 12px; color: var(--muted); margin-top: 6px; }
   .field label { display: block; font-size: 12px; font-weight: 600; margin-bottom: 4px; }
   #styleRules { min-height: 180px; font-size: 12px; }
 </style>
@@ -73,12 +80,13 @@
       <input id="model" type="text">
     </div>
     <div class="field">
-      <label for="clientId">Calendar: Entra app (client) ID</label>
+      <label for="clientId">Microsoft Entra app (client) ID: calendar, full thread, attachments</label>
       <input id="clientId" type="text" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autocomplete="off">
     </div>
     <div class="field">
       <label><input id="useCalendar" type="checkbox" style="width:auto;margin-right:6px">Use my calendar for time slots</label>
-      <button class="linkbtn" id="testCalendar" type="button">Test calendar</button>
+      <label><input id="useAttachments" type="checkbox" style="width:auto;margin-right:6px">Read attachments in the thread (PDF, images, Word, PowerPoint, Excel)</label>
+      <button class="linkbtn" id="testCalendar" type="button">Test connection</button>
       <div class="status" id="calStatus"></div>
     </div>
     <div class="field">
@@ -101,6 +109,9 @@
     <div class="label" id="modeLabel">Replying to</div>
     <div><b id="metaFrom">…</b></div>
     <div class="muted" id="metaSubject">Loading mail…</div>
+    <div class="note" id="ctxSummary"></div>
+    <div class="files" id="attList"></div>
+    <div class="note links" id="linkList"></div>
   </div>
 
   <!-- Instruction -->
@@ -108,6 +119,11 @@
     <div class="label">What should the reply say? (optional)</div>
     <div class="chips" id="chips"></div>
     <textarea id="instruction" placeholder="e.g. Zusagen, Dienstag 14 Uhr passt. Deck bitte vorab schicken."></textarea>
+    <div class="row" style="margin-top:8px">
+      <label class="chip" for="fileInput" id="dropZone">+ Add file (e.g. deck PDF from DocSend)</label>
+      <input type="file" id="fileInput" multiple class="hidden" accept=".pdf,.png,.jpg,.jpeg,.gif,.webp,.docx,.pptx,.xlsx,.txt,.csv,.md">
+    </div>
+    <div class="files" id="manualList"></div>
     <div class="row">
       <button class="btn" id="generate">Draft reply</button>
     </div>
@@ -153,6 +169,7 @@
     clientId: "",
     tenant: "ecapital.vc",
     useCalendar: "1",
+    useAttachments: "1",
     styleRules: DEFAULT_STYLE
   };
 
@@ -212,6 +229,7 @@
     }).join("\n");
     $("clientId").value = settings.clientId;
     $("useCalendar").checked = settings.useCalendar === "1";
+    $("useAttachments").checked = settings.useAttachments === "1";
     $("apiKey").value = settings.apiKey;
     $("model").value = settings.model;
     $("calendly").value = settings.calendly;
@@ -225,6 +243,7 @@
     settings.calendly = $("calendly").value.trim();
     settings.clientId = $("clientId").value.trim();
     settings.useCalendar = $("useCalendar").checked ? "1" : "0";
+    settings.useAttachments = $("useAttachments").checked ? "1" : "0";
     pca = null;
     settings.styleRules = $("styleRules").value.trim() || DEFAULT_STYLE;
     Object.keys(settings).forEach(function (k) { rs.set(k, settings[k]); });
@@ -279,13 +298,14 @@
   async function getGraphToken() {
     if (!window.msal) throw new Error("Sign-in library didn't load.");
     if (!pca) {
-      pca = await msal.createNestablePublicClientApplication({
+      pca = msal.createNestablePublicClientApplication({
         auth: { clientId: settings.clientId, authority: "https://login.microsoftonline.com/" + (settings.tenant || "organizations") }
       });
     }
-    var req = { scopes: ["Calendars.ReadBasic"] };
-    try { return (await pca.acquireTokenSilent(req)).accessToken; }
-    catch (e) { return (await pca.acquireTokenPopup(req)).accessToken; }
+    var app = await pca;   // one shared promise, so parallel calls don't create two clients
+    var req = { scopes: ["Calendars.ReadBasic", "Mail.Read"] };
+    try { return (await app.acquireTokenSilent(req)).accessToken; }
+    catch (e) { return (await app.acquireTokenPopup(req)).accessToken; }
   }
   // Naive Berlin wall-clock time <-> number (ms, using UTC fields so the browser's own zone never interferes)
   function naive(str) {
@@ -353,13 +373,246 @@
     try {
       var w = await getFreeSlots();
       setStatus($("calStatus"), "Connected. Next free windows:<br>" + w.slice(0, 3).map(esc).join("<br>"), "ok");
+      threadPromise = loadThread(); renderThreadSummary();
     } catch (e) {
       setStatus($("calStatus"), "Calendar error: " + esc(e.message || e), "err");
     }
   }
 
+  // ---------- full thread, attachments, links ----------
+  var threadPromise = null;   // resolves to {messages, attachments, links} or null
+  var manualFiles = [];       // [{name, size, data(base64), type}]
+  var MAX_THREAD_CHARS = 60000, MAX_ATTACH = 6, MAX_ATTACH_BYTES = 15e6, MAX_TOTAL_BYTES = 20e6, MIN_IMAGE_BYTES = 30e3;
+  var DOC_HOSTS = /(docsend\.com|drive\.google\.com|docs\.google\.com|dropbox\.com|notion\.(so|site)|pitch\.com|papermark\.(io|com)|brieflink\.com|sharepoint\.com|1drv\.ms|onedrive\.live\.com|wetransfer\.com|we\.tl|box\.com|figma\.com|canva\.com)/i;
+
+  function ext(name) { var m = String(name).toLowerCase().match(/\.([a-z0-9]+)$/); return m ? m[1] : ""; }
+  function kind(name, type) {
+    var e = ext(name);
+    if (e === "pdf" || /pdf/.test(type)) return "pdf";
+    if (/^(png|jpe?g|gif|webp)$/.test(e) || /^image\/(png|jpeg|gif|webp)/.test(type)) return "image";
+    if (/^(docx|pptx|xlsx)$/.test(e)) return e;
+    if (/^(txt|csv|md)$/.test(e) || /^text\//.test(type)) return "text";
+    return null;
+  }
+  function kb(n) { return n > 1e6 ? (n / 1e6).toFixed(1) + " MB" : Math.max(1, Math.round(n / 1e3)) + " KB"; }
+  function trimQuoted(t) {
+    t = String(t || "").replace(/\r/g, "");
+    var re = /^(?:_{10,}|-{3,}\s*(?:Original Message|Ursprüngliche Nachricht)|(?:From|Von):\s.*\n(?:Sent|Gesendet|Date|Datum):|On .{5,120} wrote:|Am .{5,120} schrieb .{1,100}:)/m;
+    var m = t.match(re);
+    var cut = m ? t.slice(0, m.index) : t;
+    return cut.trim() || t.slice(0, 2000).trim();
+  }
+  function gname(r) { return r && r.emailAddress ? (r.emailAddress.name || r.emailAddress.address) : ""; }
+
+  async function graphGet(url, token, extraHeaders) {
+    var h = { Authorization: "Bearer " + token };
+    Object.assign(h, extraHeaders || {});
+    var r = await fetch(url, { headers: h });
+    if (!r.ok) throw new Error("Graph " + r.status);
+    return r.json();
+  }
+
+  async function loadThread() {
+    var item = Office.context.mailbox.item;
+    if (!settings.clientId || !item.conversationId) return null;
+    var token = await getGraphToken();
+    var url = "https://graph.microsoft.com/v1.0/me/messages?$filter=" +
+      encodeURIComponent("conversationId eq '" + item.conversationId.replace(/'/g, "''") + "'") +
+      "&$select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,hasAttachments,isDraft&$top=50";
+    var msgs = [];
+    while (url) {
+      var j = await graphGet(url, token, { Prefer: 'outlook.body-content-type="text"' });
+      msgs = msgs.concat(j.value || []);
+      url = j["@odata.nextLink"] || null;
+    }
+    msgs = msgs.filter(function (m) { return !m.isDraft; })
+      .sort(function (a, b) { return a.receivedDateTime < b.receivedDateTime ? -1 : 1; });
+
+    // links to externally hosted documents
+    var links = [];
+    msgs.forEach(function (m) {
+      (String(m.body && m.body.content || "").match(/https?:\/\/[^\s<>"')\]]+/g) || []).forEach(function (u) {
+        u = u.replace(/[.,;:]+$/, "");
+        if (DOC_HOSTS.test(u) && links.indexOf(u) < 0) links.push(u);
+      });
+    });
+
+    // attachment metadata (newest mail first, deduped by name+size)
+    var atts = [], seen = {};
+    if (settings.useAttachments === "1") {
+      for (var i = msgs.length - 1; i >= 0; i--) {
+        var m = msgs[i];
+        if (!m.hasAttachments) continue;
+        var a = await graphGet("https://graph.microsoft.com/v1.0/me/messages/" + encodeURIComponent(m.id) +
+          "/attachments?$select=id,name,contentType,size,isInline", token);
+        (a.value || []).forEach(function (x) {
+          var k = kind(x.name, x.contentType || "");
+          var key = x.name + "|" + x.size;
+          if (x["@odata.type"] !== "#microsoft.graph.fileAttachment" || x.isInline || !k || seen[key]) return;
+          if (k === "image" && x.size < MIN_IMAGE_BYTES) return;   // signature logos
+          seen[key] = 1;
+          atts.push({ msgId: m.id, id: x.id, name: x.name, type: x.contentType || "", size: x.size, kind: k,
+            from: gname(m.from), date: m.receivedDateTime, skip: x.size > MAX_ATTACH_BYTES ? "too large" : "" });
+        });
+      }
+    }
+    var used = 0, n = 0;
+    atts.forEach(function (a) {
+      if (a.skip) return;
+      if (n >= MAX_ATTACH || used + a.size > MAX_TOTAL_BYTES) { a.skip = "limit reached"; return; }
+      n++; used += a.size;
+    });
+    return { messages: msgs, attachments: atts, links: links.slice(0, 10), token: token };
+  }
+
+  function openLink(u) {
+    try { Office.context.ui.openBrowserWindow(u); } catch (e) { window.open(u, "_blank"); }
+  }
+  async function renderThreadSummary() {
+    if (!threadPromise) return;
+    $("ctxSummary").textContent = "Loading full conversation…";
+    try {
+      var t = await threadPromise;
+      if (!t) { $("ctxSummary").textContent = ""; return; }
+      var use = t.attachments.filter(function (a) { return !a.skip; });
+      $("ctxSummary").textContent = "Context: " + t.messages.length + " mail" + (t.messages.length === 1 ? "" : "s") + " in this conversation" +
+        (settings.useAttachments === "1" ? " · " + use.length + " attachment" + (use.length === 1 ? "" : "s") : "");
+      $("attList").innerHTML = t.attachments.map(function (a) {
+        return "<div><span>📎 " + esc(a.name) + "</span><span class=\"muted\">" + (a.skip ? esc(a.skip) : kb(a.size)) + "</span></div>";
+      }).join("");
+      $("linkList").innerHTML = t.links.length
+        ? "Linked documents can't be opened from here (login or viewer pages). Download the PDF and add it with <b>+ Add file</b>:<br>" +
+          t.links.map(function (u, i) { return "<a href=\"#\" data-i=\"" + i + "\">" + esc(u) + "</a>"; }).join("<br>")
+        : "";
+      Array.prototype.forEach.call($("linkList").querySelectorAll("a"), function (el) {
+        el.addEventListener("click", function (e) { e.preventDefault(); openLink(t.links[+el.getAttribute("data-i")]); });
+      });
+    } catch (e) {
+      $("ctxSummary").textContent = "Full conversation not available (" + (e.message || e) + "). Using this mail only.";
+    }
+  }
+
+  // ---- converting files into Claude content blocks ----
+  function b64ToBytes(b64) { var bin = atob(b64), u = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; }
+  function xmlText(xml, tag) {
+    var doc = new DOMParser().parseFromString(xml, "application/xml");
+    return doc.getElementsByTagName(tag);
+  }
+  async function officeToText(k, b64) {
+    var zip = await JSZip.loadAsync(b64, { base64: true });
+    if (k === "docx") {
+      var x = await zip.file("word/document.xml").async("string");
+      return Array.prototype.map.call(xmlText(x, "w:p"), function (p) {
+        return Array.prototype.map.call(p.getElementsByTagName("w:t"), function (t) { return t.textContent; }).join("");
+      }).filter(Boolean).join("\n");
+    }
+    if (k === "pptx") {
+      var names = Object.keys(zip.files).filter(function (n) { return /^ppt\/slides\/slide\d+\.xml$/.test(n); })
+        .sort(function (a, b) { return parseInt(a.match(/\d+/)[0]) - parseInt(b.match(/\d+/)[0]); });
+      var out = [];
+      for (var i = 0; i < names.length; i++) {
+        var sx = await zip.file(names[i]).async("string");
+        var paras = Array.prototype.map.call(xmlText(sx, "a:p"), function (p) {
+          return Array.prototype.map.call(p.getElementsByTagName("a:t"), function (t) { return t.textContent; }).join("");
+        }).filter(Boolean);
+        out.push("--- Slide " + (i + 1) + " ---\n" + paras.join("\n"));
+      }
+      return out.join("\n");
+    }
+    if (k === "xlsx") {
+      var shared = [];
+      if (zip.file("xl/sharedStrings.xml")) {
+        var ss = await zip.file("xl/sharedStrings.xml").async("string");
+        shared = Array.prototype.map.call(xmlText(ss, "si"), function (si) { return si.textContent; });
+      }
+      var sheets = Object.keys(zip.files).filter(function (n) { return /^xl\/worksheets\/sheet\d+\.xml$/.test(n); }).sort();
+      var res = [];
+      for (var s2 = 0; s2 < sheets.length; s2++) {
+        var wx = await zip.file(sheets[s2]).async("string");
+        var rows = Array.prototype.map.call(xmlText(wx, "row"), function (r) {
+          return Array.prototype.map.call(r.getElementsByTagName("c"), function (c) {
+            var v = c.getElementsByTagName("v")[0], t = c.getAttribute("t");
+            if (t === "inlineStr") return c.textContent;
+            if (!v) return "";
+            return t === "s" ? (shared[+v.textContent] || "") : v.textContent;
+          }).join("\t");
+        });
+        res.push("--- Sheet " + (s2 + 1) + " ---\n" + rows.slice(0, 400).join("\n"));
+      }
+      return res.join("\n");
+    }
+    return "";
+  }
+  async function toBlocks(name, k, b64, contextLine) {
+    if (k === "pdf") return [{ type: "document", title: name, context: contextLine, source: { type: "base64", media_type: "application/pdf", data: b64 } }];
+    if (k === "image") {
+      var e = ext(name), mt = e === "png" ? "image/png" : e === "gif" ? "image/gif" : e === "webp" ? "image/webp" : "image/jpeg";
+      if (b64.length > 6.5e6) throw new Error("image too large");
+      return [{ type: "text", text: "Image attachment: " + name + " (" + contextLine + ")" }, { type: "image", source: { type: "base64", media_type: mt, data: b64 } }];
+    }
+    var text = k === "text" ? new TextDecoder("utf-8").decode(b64ToBytes(b64)) : await officeToText(k, b64);
+    if (!text.trim()) throw new Error("no readable text");
+    return [{ type: "document", title: name, context: contextLine, source: { type: "text", media_type: "text/plain", data: text.slice(0, 150000) } }];
+  }
+  async function attachmentBlocks(t, onProgress) {
+    var blocks = [], skipped = [];
+    var list = t ? t.attachments.filter(function (a) { return !a.skip; }) : [];
+    for (var i = 0; i < list.length; i++) {
+      var a = list[i];
+      onProgress("Reading " + a.name + "…");
+      try {
+        var full = await graphGet("https://graph.microsoft.com/v1.0/me/messages/" + encodeURIComponent(a.msgId) + "/attachments/" + encodeURIComponent(a.id), t.token);
+        var ctxLine = "Attached to the mail from " + a.from + " on " + new Date(a.date).toLocaleDateString("de-DE");
+        blocks = blocks.concat(await toBlocks(a.name, a.kind, full.contentBytes, ctxLine));
+      } catch (e) { skipped.push(a.name + " (" + (e.message || e) + ")"); }
+    }
+    for (var j = 0; j < manualFiles.length; j++) {
+      var f = manualFiles[j];
+      try { blocks = blocks.concat(await toBlocks(f.name, f.kind, f.data, "Added by Yanick (e.g. downloaded from a link in the thread)")); }
+      catch (e) { skipped.push(f.name + " (" + (e.message || e) + ")"); }
+    }
+    return { blocks: blocks, skipped: skipped };
+  }
+  function addManualFiles(files) {
+    Array.prototype.forEach.call(files, function (file) {
+      var k = kind(file.name, file.type);
+      if (!k) { setStatus($("genStatus"), esc(file.name) + ": file type not supported.", "err"); return; }
+      if (file.size > MAX_ATTACH_BYTES) { setStatus($("genStatus"), esc(file.name) + " is too large (max 15 MB).", "err"); return; }
+      var r = new FileReader();
+      r.onload = function () {
+        manualFiles.push({ name: file.name, size: file.size, kind: k, data: String(r.result).split(",")[1] });
+        renderManual();
+      };
+      r.readAsDataURL(file);
+    });
+  }
+  function renderManual() {
+    $("manualList").innerHTML = manualFiles.map(function (f, i) {
+      return "<div><span>📄 " + esc(f.name) + "</span><button class=\"linkbtn\" data-i=\"" + i + "\">remove</button></div>";
+    }).join("");
+    Array.prototype.forEach.call($("manualList").querySelectorAll("button"), function (b) {
+      b.addEventListener("click", function () { manualFiles.splice(+b.getAttribute("data-i"), 1); renderManual(); });
+    });
+  }
+  function threadText(t) {
+    var me = (Office.context.mailbox.userProfile.emailAddress || "").toLowerCase();
+    var items = t.messages.map(function (m, i) {
+      var from = m.from && m.from.emailAddress ? m.from.emailAddress : {};
+      var who = (from.address || "").toLowerCase() === me ? "Yanick" : (from.name || from.address || "?") + " <" + (from.address || "") + ">";
+      var head = "--- Mail " + (i + 1) + "/" + t.messages.length + " · " + new Date(m.receivedDateTime).toLocaleString("de-DE", { timeZone: "Europe/Berlin" }) +
+        " · From: " + who + " · To: " + (m.toRecipients || []).map(gname).join(", ") +
+        ((m.ccRecipients || []).length ? " · Cc: " + m.ccRecipients.map(gname).join(", ") : "") + " ---";
+      return { head: head, body: trimQuoted(m.body && m.body.content) };
+    });
+    var total = items.reduce(function (n, x) { return n + x.body.length; }, 0);
+    for (var i = 0; i < items.length - 2 && total > MAX_THREAD_CHARS; i++) {   // shorten oldest mails first
+      if (items[i].body.length > 1500) { total -= items[i].body.length - 1500; items[i].body = items[i].body.slice(0, 1500) + " […]"; }
+    }
+    return items.map(function (x) { return x.head + "\n" + x.body; }).join("\n\n");
+  }
+
   // ---------- prompt ----------
-  function buildPrompt(instruction, slots) {
+  function buildPrompt(instruction, slots, t, hasDocs) {
     var system =
       "You are the chief of staff of Yanick Rosenbaum, Investment Manager DeepTech / Cybersecurity at " +
       "eCAPITAL Entrepreneurial Partners (venture capital, Germany; colleagues use @ecapital.vc addresses). " +
@@ -381,14 +634,27 @@
       parts.push("To: " + ctx.to);
       if (ctx.cc) parts.push("Cc: " + ctx.cc);
       if (ctx.received) parts.push("Received: " + ctx.received);
-      parts.push("<email>\n" + ctx.body + "\n</email>");
+      if (t && t.messages.length) {
+        parts.push("<conversation> (whole email conversation, oldest first; quoted history removed; the last mail from someone other than Yanick is usually the one to answer)\n" + threadText(t) + "\n</conversation>");
+        parts.push("The mail Yanick opened (reply to this one):\n<email>\n" + trimQuoted(ctx.body).slice(0, 8000) + "\n</email>");
+      } else {
+        parts.push("<email>\n" + ctx.body + "\n</email>");
+      }
     } else {
       parts.push("Yanick is writing this email in Outlook. The current draft may already contain some text of his and, below it, the quoted thread he is replying to.");
       parts.push("Subject: " + ctx.subject);
       parts.push("To: " + ctx.to);
       if (ctx.cc) parts.push("Cc: " + ctx.cc);
+      if (t && t.messages.length) parts.push("<conversation> (earlier mails, oldest first)\n" + threadText(t) + "\n</conversation>");
       parts.push("<current_draft>\n" + ctx.body + "\n</current_draft>");
       parts.push("Write the new text to go at the top of this mail (it replaces anything Yanick started; build on his notes if there are any).");
+    }
+    if (hasDocs) {
+      parts.push("");
+      parts.push("The documents above are attachments from this conversation or files Yanick added (e.g. a pitch deck). Use them for substance where it helps the reply (refer to specific points, ask sharp follow-up questions), but only state what they actually say.");
+    }
+    if (t && t.links.length) {
+      parts.push("Linked documents in the thread that could not be read: " + t.links.join(", ") + ". Don't pretend to know their content.");
     }
     if (slots && slots.length) {
       parts.push("");
@@ -422,7 +688,18 @@
       catch (e) { calNote = " (Calendar not available: " + esc(e.message || e) + ")"; }
       setStatus($("genStatus"), "<span class=\"spinner\"></span>Drafting…");
     }
-    var p = buildPrompt($("instruction").value.trim(), slots);
+    var t = null, docs = { blocks: [], skipped: [] }, ctxNote = "";
+    if (threadPromise) {
+      setStatus($("genStatus"), "<span class=\"spinner\"></span>Reading conversation…");
+      try { t = await threadPromise; } catch (e) { ctxNote = " (Only this mail used: " + esc(e.message || e) + ")"; }
+    }
+    if ((t && t.attachments.some(function (a) { return !a.skip; })) || manualFiles.length) {
+      docs = await attachmentBlocks(t, function (m) { setStatus($("genStatus"), "<span class=\"spinner\"></span>" + esc(m)); });
+      if (docs.skipped.length) ctxNote += " Skipped: " + esc(docs.skipped.join(", ")) + ".";
+    }
+    setStatus($("genStatus"), "<span class=\"spinner\"></span>Drafting…");
+    calNote = calNote + ctxNote;
+    var p = buildPrompt($("instruction").value.trim(), slots, t, docs.blocks.length > 0);
     try {
       var res = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
@@ -436,7 +713,7 @@
           model: settings.model,
           max_tokens: 1500,
           system: p.system,
-          messages: [{ role: "user", content: p.user }]
+          messages: [{ role: "user", content: docs.blocks.concat([{ type: "text", text: p.user }]) }]
         })
       });
       var data = await res.json().catch(function () { return {}; });
@@ -449,7 +726,11 @@
       if (!text) throw new Error("Empty answer from Claude.");
       $("draft").value = text;
       $("resultCard").classList.remove("hidden");
-      setStatus($("genStatus"), calNote || (slots ? "Used your calendar for times." : ""), calNote ? "err" : "ok");
+      var used = [];
+      if (t) used.push(t.messages.length + " mails");
+      if (docs.blocks.length) used.push(docs.blocks.filter(function (b) { return b.type !== "text"; }).length + " documents");
+      if (slots) used.push("your calendar");
+      setStatus($("genStatus"), (used.length ? "Used " + used.join(", ") + "." : "") + calNote, calNote ? "err" : "ok");
       setStatus($("resultStatus"), "");
       $("resultCard").scrollIntoView({ behavior: "smooth" });
     } catch (e) {
@@ -524,7 +805,11 @@
     $("instruction").addEventListener("keydown", function (e) {
       if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) generate();
     });
+    $("fileInput").addEventListener("change", function (e) { addManualFiles(e.target.files); e.target.value = ""; });
+    ["dragover", "dragenter"].forEach(function (ev) { document.addEventListener(ev, function (e) { e.preventDefault(); }); });
+    document.addEventListener("drop", function (e) { e.preventDefault(); if (e.dataTransfer && e.dataTransfer.files.length) addManualFiles(e.dataTransfer.files); });
     await loadContext();
+    if (settings.clientId) { threadPromise = loadThread(); renderThreadSummary(); }
   });
 })();
 </script>
