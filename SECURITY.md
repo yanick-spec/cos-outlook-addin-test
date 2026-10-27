@@ -18,7 +18,7 @@ Push a branch to the test repo (once: `git remote add test https://github.com/ya
 ## What protects the add-in
 
 - **No secrets in the repo.** The API key and the Entra app ID are typed into Settings and stored in the mailbox's add-in settings. Commits use the GitHub no-reply address.
-- **Content Security Policy** (`taskpane.html`, `commands.html`). The pane may only run code from this site and `appsforoffice.microsoft.com`, and may only connect to Microsoft (Graph, sign-in, Office) and `api.anthropic.com`. All script lives in `.js` files, so no inline script is allowed. If you add a service, add its address to `connect-src`, and only then.
+- **Content Security Policy** (`taskpane.html`, `commands.html`). The pane may only run code from this site and `appsforoffice.microsoft.com`, and may only connect to Microsoft (Graph, sign-in, Office) and `api.anthropic.com`. All script lives in `.js` files, so no inline script is allowed. If you add a service, add its address to `connect-src`, and only then. Office.js tries to open a telemetry frame (`telemetryservice.firstpartyapps.oaspapps.com`); the policy blocks it on purpose, and the console error about it is expected.
 - **Drafts only.** The add-in never sends mail and Claude gets no tools: it can only return text, which you review. Keep it that way. Email content is untrusted: the prompt marks it as data, and model output is escaped before it goes into the mail.
 - **Escaping.** Anything from a mail, a file name or the model goes into the page through `textContent` or `esc()`, never raw into `innerHTML`.
 - **Minimal Microsoft permissions.** Graph scopes are `Calendars.ReadBasic` and `Mail.Read`. Don't add write or send scopes. In the Entra app registration, allow only this add-in's redirect URI.
