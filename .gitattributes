@@ -1,0 +1,2 @@
+# Keep third-party files byte-for-byte as committed, so their checksums in SECURITY.md stay valid on Windows.
+vendor/** -text

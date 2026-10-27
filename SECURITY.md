@@ -30,10 +30,10 @@ Third-party code is copied into `vendor/` rather than loaded from a CDN, so it c
 
 | File | Version | SHA-256 |
 |---|---|---|
-| `vendor/msal-browser.min.js` | @azure/msal-browser 5.24.0 | `09a9a805e9f6cd80808853ba176502c25760c23526c75e317350f7b68c0100cf` |
-| `vendor/jszip.min.js` | jszip 3.10.1 | `f12f367798e35ee2d9993dba6167fc61ddb52fb89880f5a99fbb606335188410` |
+| `vendor/msal-browser.min.js` | @azure/msal-browser 5.24.0 | `ceddf899d5e462615e661da820ec4fd24de89e6ead02f0a492c00d45669d976f` |
+| `vendor/jszip.min.js` | jszip 3.10.1 | `acc7e41455a80765b5fd9c7ee1b8078a6d160bbbca455aeae854de65c947d59e` |
 
-Check on Windows: `Get-FileHash vendor\*.js -Algorithm SHA256`.
+Check on Windows: `Get-FileHash vendor\*.js -Algorithm SHA256`. `.gitattributes` keeps Git from changing line endings in `vendor/`, so the local files match what is served.
 
 `office.js` is loaded from Microsoft's CDN as Microsoft requires, and can't be pinned.
 
